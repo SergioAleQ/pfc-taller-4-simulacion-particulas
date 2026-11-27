@@ -1,33 +1,24 @@
+# Informe de paralelización
 
+Taller 4 — Simulación de partículas en paralelo.
+Fundamentos de Programación Funcional y Concurrente, Universidad del Valle.
 
-# Simulación de partículas repartida con `parallel`
+## 1. La estrategia de reparto
 
-## El cálculo
+### 1.1 Dónde se reparte
 
-`pasoSegmento` recorre un tramo del sistema y actualiza la posición de cada partícula mediante la función `mover`. Para construir el arreglo resultante se utiliza `Array.tabulate`.
+Se reparte en dos lugares:
 
-```scala
-def mover(p: Particula, dt: Double): Particula =
-  p.copy(pos = p.pos + p.vel * dt)
+- **El paso de la simulación (Punto 1).** `pasoSegmento` actualiza un tramo del sistema con `mover`, y el movimiento de una partícula no depende de las demás. Por eso los tramos se pueden resolver de forma independiente.
+- **Las magnitudes globales (Punto 3).** `energiaParalela` y `centroDeMasaParalelo` reparten el recorrido del arreglo con la misma estrategia, y combinan resultados parciales.
 
-def pasoSegmento(s: Sistema, dt: Double, desde: Int, hasta: Int): Sistema =
-  Array.tabulate(hasta - desde)(i => mover(s(desde + i), dt))
-```
+La abstracción es `parallel`, del paquete `common`: recibe dos cálculos, los evalúa posiblemente a la vez y devuelve el par de resultados.
 
-En notación matemática, la posición de cada partícula después de un intervalo de tiempo se calcula mediante:
+### 1.2 Con qué criterio se deja de partir
 
-```math
-\vec{r}_i(t+\Delta t)=\vec{r}_i(t)+\vec{v}_i\Delta t
-```
-
-El cálculo se realiza sobre el tramo entre `desde` incluido y `hasta` excluido, manteniendo la masa y la velocidad de cada partícula.
-
-Sobre ese cálculo existen dos versiones. La versión secuencial procesa todo el sistema en un solo tramo, mientras que la versión paralela divide el sistema por la mitad mientras su tamaño supere el umbral establecido.
+El tramo `[desde, hasta)` se parte por la mitad, en `mitad = desde + (hasta - desde) / 2`, mientras tenga más elementos que el umbral. Cuando tiene a lo sumo `umbral` elementos, o a lo sumo uno, se resuelve en secuencial. La condición de un solo elemento evita que un umbral cero o negativo parta indefinidamente.
 
 ```scala
-def pasoSecuencial(s: Sistema, dt: Double): Sistema =
-  pasoSegmento(s, dt, 0, s.length)
-
 def pasoParalelo(s: Sistema, dt: Double, umbral: Int): Sistema = {
   def avanzar(desde: Int, hasta: Int): Sistema =
     if (hasta - desde <= umbral || hasta - desde <= 1)
@@ -44,33 +35,6 @@ def pasoParalelo(s: Sistema, dt: Double, umbral: Int): Sistema = {
 }
 ```
 
-La diferencia entre ambas versiones es la estrategia de ejecución. Mientras que `pasoSecuencial` procesa todas las partículas de manera consecutiva, `pasoParalelo` distribuye el trabajo mediante `parallel` y posteriormente concatena los resultados parciales utilizando el operador `++`.
-
-Ambas versiones producen un sistema con las mismas partículas actualizadas y conservan su orden original.
-
-
-## La estrategia de reparto
-
-El tramo se parte por la mitad en `mitad`, y cada parte se resuelve de manera independiente, ya que el movimiento de una partícula no depende de las demás. Ningún índice aparece en ambos tramos y ninguno queda por fuera, porque el primero va desde `desde` hasta `mitad` y el segundo desde `mitad` hasta `hasta`, excluyendo el límite superior de cada tramo.
-
-Cuando el tamaño del tramo es menor o igual al umbral, o contiene como máximo una partícula, ya no se divide y se resuelve secuencialmente mediante `pasoSegmento`.
-
-Lo que combina los resultados parciales es la concatenación de arreglos mediante el operador `++`, que es una operación asociativa:
-
-```math
-(A \mathbin{++} B) \mathbin{++} C = A \mathbin{++} (B \mathbin{++} C)
-```
-
-Por lo tanto, el procesamiento de un tramo completo equivale a procesar sus dos mitades y concatenar los resultados:
-
-```math
-P_{[d,h)} = P_{[d,m)} \mathbin{++} P_{[m,h)}
-```
-
-Donde `d` representa el índice inicial, `m` el punto medio y `h` el índice final del tramo.
-
-El orden en que terminan las tareas no modifica el resultado, siempre que se concatene primero el tramo izquierdo y después el derecho. De esta manera se conserva el orden original de las partículas.
-
 El árbol de llamados para un sistema de ocho partículas con umbral 2 queda así, con las hojas resolviendo en secuencial:
 
 ```mermaid
@@ -83,130 +47,172 @@ graph TD
     C --> G["6 a 8: pasoSegmento"]
 ```
 
-## Cómo se tomaron los tiempos
+Ningún índice aparece en dos tramos ni queda por fuera: el primero va de `desde` a `mitad` y el segundo de `mitad` a `hasta`, sin incluir el límite superior de cada uno.
 
-Cada cifra se obtiene mediante ScalaMeter, la librería utilizada en el curso para medir el rendimiento de los algoritmos. La expresión `withWarmer(new Warmer.Default) measure { ... }` realiza un calentamiento previo de la máquina virtual antes de tomar las mediciones, reduciendo la influencia de las optimizaciones iniciales del compilador.
+### 1.3 Qué operación combina los resultados parciales
 
-Cada tiempo registrado corresponde a la mediana de cinco mediciones, con el propósito de reducir la influencia de valores extremos.
+| Función | Resultado parcial de cada tramo | Operación que combina |
+|---|---|---|
+| `pasoParalelo` | Un arreglo con las partículas movidas | Concatenación `izquierda ++ derecha` |
+| `energiaParalela` | Un número: la energía del tramo | Suma `+` |
+| `centroDeMasaParalelo` | Un par: suma ponderada de posiciones y masa | Suma componente a componente |
+
+Las tres son **asociativas**, y por eso agrupar el trabajo en un árbol da lo mismo que recorrerlo de izquierda a derecha (se demuestra en el informe de corrección). En el centro de masa se lleva el par y se divide **una sola vez**, al final. No se promedian los promedios de cada mitad, porque las mitades pueden pesar distinto.
+
+La concatenación con `++` copia los dos arreglos en uno nuevo en **cada nivel** del árbol. Es trabajo que la versión secuencial no hace, y pesa en los resultados (sección 4).
+
+---
+
+## 2. Cómo se tomaron los tiempos
+
+Cada cifra se obtiene con ScalaMeter, la librería que usa el curso. La expresión `withWarmer(new Warmer.Default) measure { ... }` calienta la máquina virtual antes de medir, para reducir el efecto de las optimizaciones iniciales. La función `medir` repite la medición y devuelve la mediana. Los tiempos de las tablas son la mediana de cinco mediciones. Dentro de `umbralConveniente`, para elegir el umbral, se usan tres mediciones por candidato.
 
 ```scala
-import org.scalameter._
-
 def medir[A](repeticiones: Int)(cuerpo: => A): Double = {
   val muestras = Vector.fill(repeticiones) {
     (withWarmer(new Warmer.Default) measure { cuerpo }).value
   }
   muestras.sorted.apply(muestras.length / 2)
 }
-```
 
-Para calcular la aceleración se divide el tiempo de ejecución secuencial entre el tiempo de ejecución paralelo:
-
-```scala
 def aceleracion(tSecuencial: Double, tParalelo: Double): Double =
   tSecuencial / tParalelo
 ```
 
-En notación matemática:
+La aceleración es el cociente entre el tiempo secuencial y el paralelo:
 
 ```math
-S=\frac{T_{secuencial}}{T_{paralelo}}
+S = \frac{T_{secuencial}}{T_{paralelo}}
 ```
 
-La dependencia ya viene incluida en `app/build.gradle` del repositorio:
+Las dos versiones actualizan las partículas con la misma función `mover` y construyen su resultado con `Array.tabulate` (la paralela, además, concatena). La diferencia de tiempos corresponde, entonces, al reparto y a la combinación de los resultados parciales.
 
-```gradle
-implementation 'com.storm-enroute:scalameter-core_2.13:0.21'
-```
+**La fila de control** usa un umbral igual al tamaño del sistema. Ahí `pasoParalelo` no parte nada y ejecuta directamente `pasoSegmento` sobre todo el arreglo, que es lo que hace `pasoSecuencial`. Por eso la aceleración debe dar 1. Si no da 1, la comparación no es justa o la medición está contaminada.
 
-Las dos versiones actualizan las partículas mediante la misma función de movimiento. La diferencia entre sus tiempos corresponde a la estrategia de reparto y al costo de combinar los resultados parciales.
+**La máquina** en que se midió tiene **12 procesadores lógicos**. Los sistemas tienen 1.000.000 y 1.500.000 partículas, con `dt = 0,5`. Las partículas se generan con `Array.tabulate`, con posiciones y velocidades que dependen del índice y masas entre 1 y 3. Los tiempos están en milisegundos.
 
-La medición con el umbral igual al tamaño del sistema sirve como control, debido a que `pasoParalelo` no realiza ninguna división y ejecuta directamente `pasoSegmento`, por lo que se espera un tiempo similar al de `pasoSecuencial`.
+---
 
-La máquina utilizada dispone de 12 procesadores lógicos. Las pruebas se realizan con sistemas de 1.000.000 y 1.500.000 partículas, utilizando un intervalo de tiempo de 0.5 y cuatro umbrales diferentes para cada tamaño del sistema.
+## 3. Las mediciones
 
-Las partículas se generan mediante `Array.tabulate`, con posiciones y velocidades determinadas por su índice y masas entre 1 y 3.
-
-Todos los tiempos obtenidos se expresan en milisegundos.
-
-
-## Las mediciones
-
-Las pruebas se realizaron en una máquina con 12 procesadores lógicos, utilizando dos tamaños del sistema y diferentes umbrales de paralelización. Los tiempos están expresados en milisegundos.
-
-Con el sistema fijo en 1.000.000 de partículas, según el umbral:
+### 3.1 Sistema de 1.000.000 de partículas
 
 | **Umbral** | **Niveles de división** | **Secuencial (ms)** | **Paralela (ms)** | **Aceleración** |
 | ---------- | ----------------------- | ------------------- | ----------------- | --------------- |
-| 1 000 000  | 0                       | 25,9797             | 27,0795           | 0,959           |
-| 125 000    | 3                       | 25,9797             | 16,4118           | 1,583           |
-| 15 625     | 6                       | 25,9797             | 14,8497           | **1,750**       |
-| 976        | 11                      | 25,9797             | 15,6280           | 1,662           |
+| 1 000 000 (control) | 0 | 25,9797 | 27,0795 | 0,959 |
+| 125 000 | 3 | 25,9797 | 16,4118 | 1,583 |
+| 15 625 | 6 | 25,9797 | 14,8497 | **1,750** |
+| 976 | 11 | 25,9797 | 15,6280 | 1,662 |
 
-El tiempo secuencial de referencia de esta primera tabla es de 25,9797 ms.
+El control da 0,959, cerca de 1, como se espera: las dos versiones ejecutan el mismo código y la diferencia es ruido de medición. El mejor resultado es con umbral 15.625, con aceleración 1,75 y una reducción del tiempo de aproximadamente el 42,84 %.
 
-Con el sistema fijo en 1.500.000 de partículas, según el umbral:
+### 3.2 Sistema de 1.500.000 de partículas: medición no válida
 
 | **Umbral** | **Niveles de división** | **Secuencial (ms)** | **Paralela (ms)** | **Aceleración** |
 | ---------- | ----------------------- | ------------------- | ----------------- | --------------- |
-| 1 500 000  | 0                       | 35,5215             | 86,8666           | **0,409**       |
-| 187 500    | 3                       | 35,5215             | 121,7970          | 0,292           |
-| 23 437     | 7                       | 35,5215             | 99,7153           | 0,356           |
-| 1 464      | 11                      | 35,5215             | 110,5460          | 0,321           |
+| 1 500 000 (control) | 0 | 35,5215 | 86,8666 | 0,409 |
+| 187 500 | 3 | 35,5215 | 121,7970 | 0,292 |
+| 23 437 | 7 | 35,5215 | 99,7153 | 0,356 |
+| 1 464 | 11 | 35,5215 | 110,5460 | 0,321 |
 
-El tiempo secuencial de referencia de esta segunda tabla es de 35,5215 ms.
+**Esta serie no se usa para sacar conclusiones.** Su fila de control da 0,409, y debería dar 1: en ese umbral las dos versiones ejecutan el mismo código. Un control tan alejado de 1 indica que la medición paralela está contaminada por algo ajeno al reparto. Dos señales apuntan en esa dirección:
 
-En la primera tabla, el mejor resultado se obtiene con un umbral de 15.625 partículas, alcanzando una aceleración de 1,75 y una reducción del tiempo de ejecución de aproximadamente el 42,84 %.
+- El tiempo secuencial (35,5 ms) es coherente con el del sistema de 1.000.000 (26,0 ms), porque el sistema es 1,5 veces mayor.
+- Los tiempos paralelos (87 a 122 ms) son entre 4 y 8 veces los de 1.000.000 (15 a 27 ms), un salto que el tamaño no explica.
 
-En la segunda tabla, ninguna configuración logra superar el rendimiento de la versión secuencial. Incluso la medición de control, donde el umbral es igual al tamaño del sistema, presenta una diferencia considerable.
+Una explicación posible es la presión de memoria y la recolección de basura de la máquina virtual con arreglos de ese tamaño, pero no se verificó. Por lo tanto, de esta serie solo se concluye que **la medición no es confiable**, y no que paralelizar un sistema mayor sea peor.
 
-Este comportamiento podría estar relacionado con la gestión de memoria, la recolección de basura de la máquina virtual o las condiciones de ejecución del equipo. Sin embargo, se necesitan mediciones adicionales para determinar la causa exacta.
+---
 
+## 4. Comparación con la estimación del Punto 4
 
-## Lo que dicen los números
+La estimación del Punto 4 no ejecuta nada: `tiempoEstimado(n, p, umbral)` suma la profundidad y el trabajo entre `p` procesadores. Como el trabajo secuencial es $n$ operaciones (una por partícula), la aceleración estimada es $n / \text{tiempoEstimado}(n, p, \text{umbral})$. Con $n = 1\,000\,000$ y $p = 12$:
 
-El control para el sistema de 1 000 000 de partículas responde aproximadamente como se esperaba: con un umbral de 1 000 000, la aceleración es de 0,959, obteniendo un tiempo similar al de la versión secuencial.
+| Umbral | `profundidad` | `tiempoEstimado` | Aceleración estimada | Aceleración medida |
+|---|---|---|---|---|
+| 125 000 | 3 + 125 000 = 125 003 | 125 003 + 83 333,3 ≈ 208 336 | ≈ 4,80 | 1,583 |
+| 15 625 | 6 + 15 625 = 15 631 | 15 631 + 83 333,3 ≈ 98 964 | ≈ 10,10 | **1,750** |
+| 976 | 986 | 986 + 83 333,3 ≈ 84 319 | ≈ 11,86 | 1,662 |
 
-Sin embargo, para el sistema de 1 500 000 de partículas, la medición de control presenta una aceleración de 0,409. Esta diferencia indica que pudieron intervenir factores externos a la estrategia de paralelización, como la gestión de memoria o la recolección de basura de la máquina virtual.
+Las unidades de `tiempoEstimado` son operaciones, no milisegundos, y por eso se comparan las aceleraciones. Para el control (umbral igual a $n$) la estimación no aplica: no hay partición, y la fórmula suma el tramo completo dos veces.
 
-Para el sistema de 1 000 000 de partículas, la paralelización mejora el rendimiento cuando se utiliza un umbral adecuado. Con un umbral de 125 000, la aceleración alcanza 1,583, mientras que con un umbral de 15 625 aumenta hasta 1,750.
+**En qué se parecen.**
 
-El umbral que más conviene no es necesariamente el más pequeño. El mejor tiempo se obtiene con un umbral de 15 625, correspondiente a seis niveles de división y 64 tramos para 12 procesadores lógicos. Al reducir el umbral hasta 976, la aceleración disminuye a 1,662, posiblemente debido al costo adicional de crear tareas y concatenar los resultados parciales.
+- Los dos dicen que repartir ayuda: pasar de umbral 125.000 a 15.625 mejora la aceleración, tanto en lo estimado como en lo medido.
+- Los dos muestran que la ganancia no crece de forma proporcional al número de particiones.
 
-Para el sistema de 1 500 000 de partículas, ninguna de las configuraciones paralelas supera el rendimiento de la versión secuencial. Esto demuestra que aumentar el tamaño del sistema no garantiza una mejora en el rendimiento paralelo.
+**En qué no se parecen.**
 
-La estimación teórica de trabajo y profundidad permite estudiar el comportamiento del algoritmo en condiciones idealizadas. Sin embargo, los tiempos reales también incluyen el costo de crear tareas, concatenar arreglos, reservar memoria y acceder a los recursos compartidos del equipo. No se dispone de valores numéricos de aceleración estimada para realizar una comparación directa.
+- **La magnitud.** La estimación llega a unas 10 veces con 12 procesadores, y lo medido es 1,75. Se mide menos de una quinta parte de lo estimado.
+- **El mejor umbral.** La estimación mejora siempre que el umbral baja, porque solo mira la profundidad, y sugeriría 976. En lo medido, 976 es peor que 15.625.
 
-Con la mejor aceleración medida de 1,7495 sobre 12 procesadores lógicos, la ley de Amdahl permite estimar la fracción serial efectiva del cálculo, donde p representa el número de procesadores:
+**A qué lo atribuyo.** La estimación cuenta una operación por partícula y ninguna otra cosa. No incluye:
+
+- **La concatenación.** Cada nivel del árbol copia los arreglos con `++`. La concatenación de la raíz copia las 1.000.000 de referencias en un solo hilo, y las de los niveles inferiores suman otro tanto. Esto es trabajo que la versión secuencial no hace y que no se reparte.
+- **La creación de tareas.** Con umbral 976 hay unas 2.048 tareas, frente a unas 64 con 15.625. Cada una tiene un costo fijo, y por eso el umbral más pequeño deja de ganar.
+- **La memoria.** `mover` crea objetos nuevos por cada partícula (la partícula copiada y dos vectores intermedios). El cálculo es corto por elemento y depende más del acceso a memoria y de la recolección de basura que de la aritmética, y la memoria se comparte entre los núcleos.
+
+Estas son explicaciones probables que no se midieron por separado.
+
+---
+
+## 5. La lectura de los resultados
+
+### 5.1 Qué umbral resultó conveniente y por qué
+
+En el sistema de 1.000.000 de partículas, el umbral más conveniente fue **15.625**, con aceleración 1,75. Corresponde a seis niveles de división y 64 tramos para 12 procesadores lógicos: hay bastantes tramos para repartir entre los núcleos (más del cuádruple de los procesadores, lo que compensa tramos que terminan antes que otros), y cada tramo tiene trabajo suficiente para pagar el costo de crear la tarea.
+
+- Con un umbral grande (125.000) hay solo 8 tramos. Quedan núcleos sin trabajo y la aceleración es 1,58.
+- Con un umbral pequeño (976) hay unas 2.048 tareas, y el costo de crearlas y de concatenar tantos resultados parciales quita parte de la ganancia: 1,66.
+- Con el umbral igual al tamaño, no hay reparto y la aceleración es 0,96, es decir, 1 con ruido.
+
+El umbral conveniente no es el más pequeño ni el más grande, sino un punto intermedio.
+
+### 5.2 Por qué la aceleración deja de crecer aunque se agreguen núcleos
+
+Aunque se agreguen núcleos, hay una parte del cálculo que no se reparte. Eso está en el algoritmo y no en la máquina:
+
+- La concatenación de la raíz es secuencial. Hasta que no terminan las dos mitades, no se puede unir el arreglo final.
+- La reserva de memoria y la recolección de basura se comparten, y todos los hilos acceden a la misma memoria.
+
+Esa parte fija pone un techo a la aceleración, y los núcleos adicionales solo aceleran la parte que sí se reparte (ley de Amdahl).
+
+### 5.3 Qué fracción del cálculo no se reparte
+
+Con la ley de Amdahl, donde $S(p)$ es la aceleración con $p$ procesadores y $f$ la fracción que no se reparte:
 
 ```math
 S(p)=\frac{1}{f+\frac{1-f}{p}}
 ```
 
-Despejando la fracción serial:
+Despejando $f$:
 
 ```math
 f=\frac{\frac{1}{S}-\frac{1}{p}}{1-\frac{1}{p}}
 ```
 
-Sustituyendo los valores obtenidos:
+Con la mejor aceleración medida, $S = 1{,}7495$ (umbral 15.625), y $p = 12$:
 
 ```math
-f=\frac{\frac{1}{1.7495}-\frac{1}{12}}{1-\frac{1}{12}}\approx 0.533
+f=\frac{\frac{1}{1.7495}-\frac{1}{12}}{1-\frac{1}{12}}\approx 0{,}533
 ```
 
-La fracción serial efectiva corresponde aproximadamente al 53,3 % del cálculo, mientras que el 46,7 % restante representa la fracción paralelizable según este modelo.
+Es decir, aproximadamente el **53,3 %** del cálculo no se reparte, y el 46,7 % restante sí. Es una fracción **efectiva**: agrupa todo lo que impide la aceleración ideal (concatenación, memoria, recolección de basura, costo de las tareas), no solo la parte estrictamente secuencial. Se calcula con un solo punto de medición, en una sola máquina.
 
-La aceleración máxima teórica, manteniendo constante esta fracción, es:
+La aceleración máxima teórica con esa fracción constante es:
 
 ```math
-S_{\max}=\frac{1}{f}\approx 1.88
+S_{\max}=\frac{1}{f}\approx 1{,}88
 ```
 
 | p | 2 | 4 | 8 | 12 | 16 | 32 | ∞ |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Aceleración máxima estimada | 1,30 | 1,54 | 1,69 | 1,75 | 1,78 | 1,83 | 1,88 |
 
-Pasar de 12 a 32 procesadores aumentaría la aceleración estimada de 1,75 a 1,83, lo que representa una mejora pequeña según el modelo de Amdahl.
+Pasar de 12 a 32 procesadores subiría la aceleración estimada de 1,75 a 1,83, una mejora pequeña. Esto es coherente con lo medido: con 12 procesadores lógicos ya se está cerca del techo.
 
-En conclusión, la paralelización permite mejorar el rendimiento de la simulación cuando se selecciona un umbral adecuado. Sin embargo, los costos asociados a la división del sistema, la creación de tareas, la concatenación de arreglos y la gestión de memoria pueden limitar sus beneficios. Por esta razón, es necesario realizar pruebas experimentales para determinar la configuración más conveniente.
+### 5.4 Conclusión
+
+- Repartir mejora el tiempo de `pasoParalelo` cuando el umbral es adecuado: 1,75 veces con 1.000.000 de partículas y umbral 15.625.
+- La ganancia queda lejos de la estimada porque la estimación ignora la concatenación, las tareas y la memoria.
+- La fila de control es la que dice si una comparación es confiable. Con 1.000.000 de partículas da 0,959 y la serie es válida. Con 1.500.000 da 0,409, y esa serie no se usa para concluir.
